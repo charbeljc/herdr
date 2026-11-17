@@ -611,6 +611,56 @@ pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) 
         .filter(|name| is_pane_shell_process_name(name))
 }
 
+/// A direct child of a terminal proxy, described by the facts needed to tell
+/// the shell it started on a nested pty from helpers it also started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NestedShellCandidate {
+    pub pid: u32,
+    /// Controlling terminal device, when the process has one.
+    pub tty: Option<u32>,
+}
+
+/// True when `name` is the process name of a known pty proxy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn is_pty_proxy_process_name(name: &str) -> bool {
+    normalized_process_name(name) == "atuin"
+}
+
+/// True when `argv` invokes a terminal proxy that execs over the pane shell and
+/// re-spawns the real shell on a nested pty.
+///
+/// `atuin init bash|zsh` (atuin 18.24+) replaces the interactive shell with
+/// `atuin pty-proxy --shell <shell>`, which allocates a second pty and starts
+/// the user's shell there. The pane's own tty then belongs to the proxy, so
+/// probing that tty only ever finds the proxy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn is_pty_proxy_argv(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    is_pty_proxy_process_name(program) && argv.get(1).is_some_and(|arg| arg == "pty-proxy")
+}
+
+/// Pick the shell a pty proxy started on its nested pty.
+///
+/// The proxy opens a fresh pty for the shell, so the shell's controlling
+/// terminal differs from the proxy's. Helpers the proxy also starts keep the
+/// proxy's terminal or have none. Ambiguity keeps the old behavior instead of
+/// guessing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn nested_pty_shell_pid(
+    proxy_tty: Option<u32>,
+    candidates: impl IntoIterator<Item = NestedShellCandidate>,
+) -> Option<u32> {
+    let mut shells = candidates
+        .into_iter()
+        .filter(|candidate| candidate.tty.is_some_and(|tty| Some(tty) != proxy_tty))
+        .map(|candidate| candidate.pid);
+    let shell = shells.next()?;
+    shells.next().is_none().then_some(shell)
+}
+
 fn normalized_process_name(name: &str) -> String {
     name.rsplit(['/', '\\'])
         .next()
@@ -916,6 +966,46 @@ mod tests {
         for program in ["vim", "nvim", "cargo", "test-runner", "opencode"] {
             assert!(!is_pane_shell_process_name(program), "{program}");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pty_proxy_argv_matches_only_the_proxy_subcommand() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        assert!(is_pty_proxy_argv(&argv(&["atuin", "pty-proxy"])));
+        assert!(is_pty_proxy_argv(&argv(&[
+            "/home/me/.cargo/bin/atuin",
+            "pty-proxy",
+            "--shell",
+            "/bin/bash",
+        ])));
+        assert!(!is_pty_proxy_argv(&argv(&["atuin", "history", "list"])));
+        assert!(!is_pty_proxy_argv(&argv(&["atuin", "daemon", "start"])));
+        assert!(!is_pty_proxy_argv(&argv(&["bash", "-l"])));
+        assert!(!is_pty_proxy_argv(&argv(&[])));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn nested_pty_shell_pid_requires_one_child_on_another_terminal() {
+        let candidate = |pid, tty| NestedShellCandidate { pid, tty };
+
+        assert_eq!(
+            nested_pty_shell_pid(Some(3), [candidate(10, Some(7))]),
+            Some(10)
+        );
+        assert_eq!(
+            nested_pty_shell_pid(Some(3), [candidate(10, None), candidate(11, Some(3))]),
+            None,
+            "a child sharing the proxy's terminal is not the nested shell"
+        );
+        assert_eq!(
+            nested_pty_shell_pid(Some(3), [candidate(10, Some(7)), candidate(11, Some(8))]),
+            None,
+            "ambiguous children keep the proxy instead of guessing"
+        );
+        assert_eq!(nested_pty_shell_pid(Some(3), []), None);
     }
 
     #[test]

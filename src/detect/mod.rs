@@ -359,6 +359,12 @@ pub fn foreground_job(child_pid: u32) -> Option<crate::platform::ForegroundJob> 
     crate::platform::foreground_job(child_pid)
 }
 
+/// Get the foreground job for an already-resolved pane shell.
+/// Delegates to platform-specific implementation.
+pub fn foreground_job_for_shell(shell_pid: u32) -> Option<crate::platform::ForegroundJob> {
+    crate::platform::foreground_job_for_shell(shell_pid)
+}
+
 /// Get the foreground process group leader as a one-process job.
 /// This is cheaper than collecting every process in the foreground job.
 pub fn foreground_group_leader_job(
@@ -367,10 +373,9 @@ pub fn foreground_group_leader_job(
     crate::platform::foreground_group_leader_job(process_group_id)
 }
 
-/// Get the foreground process group for a pane shell PID.
-/// This is cheaper than collecting every process in the foreground job.
-pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
-    crate::platform::foreground_process_group_id(child_pid)
+/// Get the foreground process group for an already-resolved pane shell.
+pub fn foreground_process_group_id_for_shell(shell_pid: u32) -> Option<u32> {
+    crate::platform::foreground_process_group_id_for_shell(shell_pid)
 }
 
 /// True when the pane's own shell is at its prompt with nothing running in it.

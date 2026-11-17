@@ -346,16 +346,86 @@ fn shell_quote(value: &str) -> String {
 
 /// Collect the foreground terminal job for a given child PID.
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
-    super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
+    let shell_pid = pane_shell_pid(child_pid);
+    super::available_pane_shell_from_job(shell_pid, foreground_job_for_shell(shell_pid)?)
 }
 
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
-    let process_group_id = foreground_process_group_id(child_pid).or_else(|| {
+    foreground_job_for_shell(pane_shell_pid(child_pid))
+}
+
+/// Collect the foreground terminal job for an already-resolved pane shell.
+pub fn foreground_job_for_shell(shell_pid: u32) -> Option<ForegroundJob> {
+    let process_group_id = foreground_process_group_id_for_shell(shell_pid).or_else(|| {
         (process_detection_mode() == ProcessDetectionMode::ChildGroups)
-            .then(|| child_groups_foreground_process_group(child_pid))
+            .then(|| child_groups_foreground_process_group(shell_pid))
             .flatten()
     })?;
-    foreground_job_for_group(child_pid, process_group_id)
+    foreground_job_for_group(shell_pid, process_group_id)
+}
+
+/// Resolve the process that owns the pane's interactive shell.
+///
+/// A pty proxy execs over the shell herdr spawned and re-spawns the real shell
+/// on a nested pty, so the pane's child is the proxy. The proxy keeps the pane's
+/// tty, so probing that tty only ever finds the proxy; the shell, and whatever
+/// the user runs in it, live under the proxy's child.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    pty_proxy_nested_shell_pid(child_pid).unwrap_or(child_pid)
+}
+
+fn pty_proxy_nested_shell_pid(pid: u32) -> Option<u32> {
+    let proxy = process_job_stat(pid)?;
+    if !super::is_pty_proxy_process_name(&proxy.comm)
+        || !process_allows_remote_memory_read(proxy.state, &proxy.comm, running_inside_wsl())
+    {
+        return None;
+    }
+    pty_proxy_nested_shell_pid_with(
+        pid,
+        proxy.tty,
+        process_argv,
+        direct_child_pids,
+        process_job_stat,
+    )
+}
+
+fn pty_proxy_nested_shell_pid_with(
+    pid: u32,
+    proxy_tty: i32,
+    read_argv: impl Fn(u32) -> Option<Vec<String>>,
+    read_children: impl Fn(u32) -> Vec<u32>,
+    read_stat: impl Fn(u32) -> Option<ProcessJobStat>,
+) -> Option<u32> {
+    if !super::is_pty_proxy_argv(&read_argv(pid)?) {
+        return None;
+    }
+
+    let candidates = read_children(pid)
+        .into_iter()
+        .filter_map(|child| {
+            let stat = read_stat(child)?;
+            (stat.tty > 0).then_some(super::NestedShellCandidate {
+                pid: child,
+                tty: Some(stat.tty as u32),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    super::nested_pty_shell_pid((proxy_tty > 0).then_some(proxy_tty as u32), candidates)
+}
+
+/// Direct children of `pid`, bounded by the same per-root budget the
+/// foreground-tree walk uses so an unreaped child list cannot grow the probe.
+fn direct_child_pids(pid: u32) -> Vec<u32> {
+    let mut budget = ForegroundScanBudget::for_probe();
+    let mut children = Vec::new();
+    for tid in process_task_ids(pid, &mut budget) {
+        children.extend(process_task_children(pid, tid, &mut budget));
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
 }
 
 fn foreground_job_for_group(child_pid: u32, process_group_id: u32) -> Option<ForegroundJob> {
@@ -652,13 +722,13 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
 }
 
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
+    foreground_process_group_id_for_shell(pane_shell_pid(child_pid))
+}
+
+/// Foreground process group of an already-resolved pane shell.
+pub fn foreground_process_group_id_for_shell(shell_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
-    // The (comm) field can contain spaces and parens, so we find the last ')' first.
-    let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat")).ok()?;
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
-    let tpgid: i32 = fields.get(5)?.parse().ok()?;
+    let tpgid = process_job_stat(shell_pid)?.tpgid;
     (tpgid > 0).then_some(tpgid as u32)
 }
 
@@ -677,6 +747,7 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
 /// token, is alive in the terminal session of the pane shell `shell_pid`.
 /// A stopped or backgrounded job still counts.
 pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let shell_pid = pane_shell_pid(shell_pid);
     let stat = process_job_stat(pid)?;
     let shell_session = process_job_stat(shell_pid)?.session;
     (!matches!(stat.state, 'Z' | 'X')
@@ -686,11 +757,14 @@ pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Op
         .then_some(stat.pgrp as u32)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessJobStat {
+    comm: String,
     state: char,
     pgrp: i32,
     session: i32,
+    tty: i32,
+    tpgid: i32,
     start_time: u64,
 }
 
@@ -700,13 +774,19 @@ fn process_job_stat(pid: u32) -> Option<ProcessJobStat> {
 }
 
 fn process_job_stat_from_stat(stat: &str) -> Option<ProcessJobStat> {
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    // The (comm) field can contain spaces and parens, so find the last ')' first.
+    let close = stat.rfind(')')?;
+    let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
+    let rest = stat.get(close + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // After (comm): state(0) ppid(1) pgrp(2) session(3) ... starttime(19)
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5) ... starttime(19)
     Some(ProcessJobStat {
+        comm,
         state: fields.first()?.chars().next()?,
         pgrp: fields.get(2)?.parse().ok()?,
         session: fields.get(3)?.parse().ok()?,
+        tty: fields.get(4)?.parse().ok()?,
+        tpgid: fields.get(5)?.parse().ok()?,
         start_time: fields.get(19)?.parse().ok()?,
     })
 }
@@ -1600,13 +1680,70 @@ mod tests {
         assert_eq!(
             process_job_stat_from_stat(stat),
             Some(ProcessJobStat {
+                comm: "node ) x".to_string(),
                 state: 'T',
                 pgrp: 456,
                 session: 789,
+                tty: 34816,
+                tpgid: 456,
                 start_time: 987654,
             })
         );
         assert_eq!(process_job_stat_from_stat("123 (short) S 1 456 789"), None);
+    }
+
+    fn proxy_stat(comm: &str, tty: i32) -> ProcessJobStat {
+        ProcessJobStat {
+            comm: comm.to_string(),
+            state: 'S',
+            pgrp: 100,
+            session: 100,
+            tty,
+            tpgid: 100,
+            start_time: 1,
+        }
+    }
+
+    #[test]
+    fn pty_proxy_resolution_follows_the_nested_shell() {
+        let argv = |pid| match pid {
+            100 => Some(
+                ["atuin", "pty-proxy", "--shell", "/bin/bash"]
+                    .map(str::to_string)
+                    .to_vec(),
+            ),
+            _ => Some(["bash"].map(str::to_string).to_vec()),
+        };
+        let children = |pid| (pid == 100).then_some(vec![101, 102]).unwrap_or_default();
+        let stat = |pid| match pid {
+            100 => Some(proxy_stat("atuin", 34818)),
+            101 => Some(proxy_stat("bash", 34823)),
+            // A helper sharing the proxy's terminal must not be taken for the shell.
+            102 => Some(proxy_stat("helper", 34818)),
+            _ => None,
+        };
+
+        assert_eq!(
+            pty_proxy_nested_shell_pid_with(100, 34818, argv, children, stat),
+            Some(101)
+        );
+        assert_eq!(
+            pty_proxy_nested_shell_pid_with(200, 34818, argv, children, stat),
+            None,
+            "a non-proxy process keeps the pane child as its shell"
+        );
+    }
+
+    #[test]
+    fn pty_proxy_resolution_rejects_ambiguous_children() {
+        let argv = |_pid| Some(["atuin", "pty-proxy"].map(str::to_string).to_vec());
+        let children = |_pid| vec![101, 102];
+        let stat = |pid| Some(proxy_stat("bash", 34823 + pid as i32));
+
+        assert_eq!(
+            pty_proxy_nested_shell_pid_with(100, 34818, argv, children, stat),
+            None
+        );
     }
 
     #[test]

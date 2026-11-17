@@ -203,7 +203,17 @@ pub(crate) fn available_pane_shell(_child_pid: u32) -> Option<String> {
 }
 
 /// Unsupported platform stub.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    child_pid
+}
+
+/// Unsupported platform stub.
 pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn foreground_job_for_shell(_shell_pid: u32) -> Option<ForegroundJob> {
     None
 }
 
@@ -214,6 +224,11 @@ pub fn foreground_group_leader_job(_process_group_id: u32) -> Option<ForegroundJ
 
 /// Unsupported platform stub.
 pub fn foreground_process_group_id(_child_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub.
+pub fn foreground_process_group_id_for_shell(_shell_pid: u32) -> Option<u32> {
     None
 }
 

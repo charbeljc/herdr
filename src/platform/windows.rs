@@ -1686,12 +1686,26 @@ pub fn current_process_is_detached_server_daemon() -> bool {
 }
 
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
-    select_pane_foreground_job_cached(child_pid)
+    foreground_job_for_shell(pane_shell_pid(child_pid))
+}
+
+/// Collect the foreground terminal job for an already-resolved pane shell.
+///
+/// Windows has no pty proxy that re-spawns the pane shell on a nested pty, so
+/// `pane_shell_pid` is the identity and the pane's child pid is the shell pid.
+pub fn foreground_job_for_shell(shell_pid: u32) -> Option<ForegroundJob> {
+    select_pane_foreground_job_cached(shell_pid)
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     let snapshot = ProcessSnapshot::new(snapshot_processes());
     available_pane_shell_from_snapshot(child_pid, &snapshot)
+}
+
+/// Windows has no pty proxy that re-spawns the pane shell on a nested pty, so
+/// the pane's child is the shell.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    child_pid
 }
 
 fn available_pane_shell_from_snapshot(
@@ -1716,8 +1730,12 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
-pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
-    select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
+/// Foreground process group of an already-resolved pane shell.
+///
+/// The resolving entry point exists only for Unix callers; Windows resolves the
+/// pane shell through `foreground_job` and has no separate `child_pid` variant.
+pub fn foreground_process_group_id_for_shell(shell_pid: u32) -> Option<u32> {
+    select_pane_foreground_job_cached(shell_pid).map(|job| job.process_group_id)
 }
 
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {

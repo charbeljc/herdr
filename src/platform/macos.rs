@@ -428,16 +428,100 @@ fn target_nofile_soft_limit(
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
-    super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
+    let shell_pid = pane_shell_pid(child_pid);
+    super::available_pane_shell_from_job(shell_pid, foreground_job_for_shell(shell_pid)?)
+}
+
+/// Resolve the process that owns the pane's interactive shell.
+///
+/// A pty proxy execs over the shell herdr spawned and re-spawns the real shell
+/// on a nested pty, so the pane's child is the proxy. The proxy keeps the pane's
+/// tty, so probing that tty only ever finds the proxy; the shell, and whatever
+/// the user runs in it, live under the proxy's child.
+pub(crate) fn pane_shell_pid(child_pid: u32) -> u32 {
+    pty_proxy_nested_shell_pid(child_pid).unwrap_or(child_pid)
+}
+
+fn pty_proxy_nested_shell_pid(pid: u32) -> Option<u32> {
+    let info = process_bsdinfo(pid)?;
+    let comm = comm_from_bsdinfo(&info)?;
+    if !super::is_pty_proxy_process_name(&comm) {
+        return None;
+    }
+    pty_proxy_nested_shell_pid_with(
+        pid,
+        info.e_tdev,
+        process_argv,
+        direct_child_pids,
+        process_bsdinfo,
+    )
+}
+
+fn pty_proxy_nested_shell_pid_with(
+    pid: u32,
+    proxy_tty: u32,
+    read_argv: impl Fn(u32) -> Option<Vec<String>>,
+    read_children: impl Fn(u32) -> Vec<u32>,
+    read_info: impl Fn(u32) -> Option<libc::proc_bsdinfo>,
+) -> Option<u32> {
+    if !super::is_pty_proxy_argv(&read_argv(pid)?) {
+        return None;
+    }
+
+    let candidates = read_children(pid)
+        .into_iter()
+        .filter_map(|child| {
+            let info = read_info(child)?;
+            (info.e_tdev != 0).then_some(super::NestedShellCandidate {
+                pid: child,
+                tty: Some(info.e_tdev),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    super::nested_pty_shell_pid((proxy_tty != 0).then_some(proxy_tty), candidates)
+}
+
+fn direct_child_pids(pid: u32) -> Vec<u32> {
+    let mut capacity = 16usize;
+
+    for _ in 0..4 {
+        let mut pids = vec![0 as libc::pid_t; capacity];
+        let buffer_bytes = pids.len() * std::mem::size_of::<libc::pid_t>();
+        let returned_bytes = unsafe {
+            libc::proc_listchildpids(
+                pid as libc::pid_t,
+                pids.as_mut_ptr() as *mut libc::c_void,
+                buffer_bytes as libc::c_int,
+            )
+        };
+        if returned_bytes <= 0 {
+            return Vec::new();
+        }
+
+        let returned_bytes = returned_bytes as usize;
+        let count = returned_bytes / std::mem::size_of::<libc::pid_t>();
+        if returned_bytes < buffer_bytes {
+            return collect_positive_pids(pids, count);
+        }
+        capacity = capacity.saturating_mul(2);
+    }
+
+    Vec::new()
 }
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
-    if child_pid == 0 {
+    foreground_job_for_shell(pane_shell_pid(child_pid))
+}
+
+/// Collect the foreground terminal job for an already-resolved pane shell.
+pub fn foreground_job_for_shell(shell_pid: u32) -> Option<ForegroundJob> {
+    if shell_pid == 0 {
         return None;
     }
 
-    let fg_pgid = foreground_process_group_id(child_pid)?;
+    let fg_pgid = foreground_process_group_id_for_shell(shell_pid)?;
     let mut processes = Vec::new();
 
     for pid in process_group_pids(fg_pgid) {
@@ -523,6 +607,12 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
 /// Read `e_tpgid` (foreground process group of the controlling terminal)
 /// for the given PID.
 pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
+    foreground_process_group_id_for_shell(pane_shell_pid(pid))
+}
+
+/// Read `e_tpgid` (foreground process group of the controlling terminal)
+/// for an already-resolved pane shell.
+pub fn foreground_process_group_id_for_shell(shell_pid: u32) -> Option<u32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
 
@@ -936,6 +1026,7 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
 /// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
 /// backgrounded job still counts.
 pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let shell_pid = pane_shell_pid(shell_pid);
     let process = process_bsdinfo(pid)?;
     let shell = process_bsdinfo(shell_pid)?;
     (process.pbi_status != libc::SZOMB

@@ -913,12 +913,17 @@ fn probe_foreground_process_from_jobs(
     }
 }
 
-fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+/// Probe the foreground process of `shell_pid`, the pane's effective shell.
+///
+/// The caller resolves a pty proxy (atuin) before probing: the proxy owns the
+/// pane's tty while the real shell and agent run under its child, so every
+/// process fact here must come from the shell, not the pane's child pid.
+fn probe_foreground_process(shell_pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
     probe_foreground_process_from_jobs(
-        pid,
+        shell_pid,
         foreground_pgid,
         foreground_pgid.and_then(crate::detect::foreground_group_leader_job),
-        || crate::detect::foreground_job(pid),
+        || crate::detect::foreground_job_for_shell(shell_pid),
         crate::platform::process_agent_hint,
     )
 }
@@ -1025,8 +1030,13 @@ fn spawn_basic_detection_task(
                 pane_id,
             )
             .await;
+            let shell_pid = if pid > 0 {
+                crate::platform::pane_shell_pid(pid)
+            } else {
+                pid
+            };
             let foreground_pgid = (pid > 0)
-                .then(|| crate::detect::foreground_process_group_id(pid))
+                .then(|| crate::detect::foreground_process_group_id_for_shell(shell_pid))
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
@@ -1054,7 +1064,7 @@ fn spawn_basic_detection_task(
                 last_process_check = now;
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
-                let probe = probe_foreground_process(pid, foreground_pgid);
+                let probe = probe_foreground_process(shell_pid, foreground_pgid);
                 let process_group_id = probe.process_group_id;
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
@@ -2986,9 +2996,14 @@ impl PaneRuntime {
                     );
                     #[cfg(not(windows))]
                     let foreground_observation_due = true;
+                    let shell_pid = if pid > 0 {
+                        crate::platform::pane_shell_pid(pid)
+                    } else {
+                        pid
+                    };
                     let foreground_pgid = match (pid, foreground_observation_due) {
                         (0, _) => None,
-                        (_, true) => detect::foreground_process_group_id(pid),
+                        (_, true) => detect::foreground_process_group_id_for_shell(shell_pid),
                         _ => last_foreground_pgid,
                     };
                     #[cfg(windows)]
@@ -3017,7 +3032,7 @@ impl PaneRuntime {
                         let had_process_probe = has_process_probe;
                         has_process_probe = true;
                         if pid > 0 {
-                            let probe = probe_foreground_process(pid, foreground_pgid);
+                            let probe = probe_foreground_process(shell_pid, foreground_pgid);
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let tracked_process_group_id = process_group_for_change_tracking(
